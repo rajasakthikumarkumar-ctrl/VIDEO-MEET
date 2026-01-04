@@ -27,6 +27,8 @@ function VideoCall() {
   const [connectionStatus, setConnectionStatus] = useState('Connecting...');
   const [isAdmin, setIsAdmin] = useState(false);
   const [participantCount, setParticipantCount] = useState(0);
+  const [showAudioWarning, setShowAudioWarning] = useState(false);
+  const [audioDevices, setAudioDevices] = useState([]);
   
   // Recording state
   const [isRecording, setIsRecording] = useState(false);
@@ -99,11 +101,34 @@ function VideoCall() {
         transports: ['websocket', 'polling']
       });
       
-      // Get user media first
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 640, height: 480 },
-        audio: true
-      });
+      // Get user media with enhanced audio settings
+      const mediaConstraints = {
+        video: { 
+          width: { ideal: 1280, max: 1920 },
+          height: { ideal: 720, max: 1080 },
+          frameRate: { ideal: 30, max: 60 },
+          facingMode: 'user'
+        },
+        audio: {
+          // Enhanced audio settings for better quality
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: { ideal: 48000 },
+          channelCount: { ideal: 1 },
+          volume: { ideal: 1.0 },
+          // Additional constraints for better audio
+          googEchoCancellation: true,
+          googAutoGainControl: true,
+          googNoiseSuppression: true,
+          googHighpassFilter: true,
+          googTypingNoiseDetection: true,
+          googAudioMirroring: false
+        }
+      };
+
+      console.log('📹 Requesting media with enhanced constraints:', mediaConstraints);
+      const stream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
 
       console.log('📹 Local stream obtained');
       setLocalStream(stream);
@@ -111,6 +136,28 @@ function VideoCall() {
       
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
+      }
+
+      // Detect audio devices and show warning if no headphones
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const audioOutputs = devices.filter(device => device.kind === 'audiooutput');
+        setAudioDevices(audioOutputs);
+        
+        // Check if likely using speakers (show warning)
+        const hasHeadphones = audioOutputs.some(device => 
+          device.label.toLowerCase().includes('headphone') ||
+          device.label.toLowerCase().includes('headset') ||
+          device.label.toLowerCase().includes('earphone')
+        );
+        
+        if (!hasHeadphones && audioOutputs.length > 0) {
+          setShowAudioWarning(true);
+          // Auto-hide warning after 10 seconds
+          setTimeout(() => setShowAudioWarning(false), 10000);
+        }
+      } catch (err) {
+        console.log('Could not enumerate devices:', err);
       }
 
       setupSocketListeners();
@@ -152,8 +199,11 @@ function VideoCall() {
       setRemoteStreams(new Map());
       peersRef.current.clear();
       
-      // Set ONLY the existing participants (excluding self)
-      const existingParticipants = room.participants || [];
+      // Set ONLY the existing participants (excluding self) with connection status
+      const existingParticipants = (room.participants || []).map(p => ({
+        ...p,
+        connectionStatus: 'connecting'
+      }));
       console.log(`📊 Setting ${existingParticipants.length} existing participants`);
       setParticipants(existingParticipants);
       setParticipantCount(existingParticipants.length + 1); // +1 for self
@@ -161,10 +211,13 @@ function VideoCall() {
       setChatMessages(room.chatMessages || []);
       setRaisedHands(room.raisedHands || []);
       
-      // Create peer connections ONLY for existing participants
-      existingParticipants.forEach(participant => {
+      // Create peer connections ONLY for existing participants with a delay
+      existingParticipants.forEach((participant, index) => {
         console.log(`🤝 Creating peer connection for existing participant: ${participant.name} (${participant.id})`);
-        createPeerConnection(participant.id, participant, true);
+        // Stagger connection creation to avoid overwhelming
+        setTimeout(() => {
+          createPeerConnection(participant.id, participant, true);
+        }, index * 200);
       });
     });
 
@@ -180,7 +233,8 @@ function VideoCall() {
         }
         
         console.log('📊 Adding participant to list. Current:', prev.length, 'Adding:', participant.name);
-        const newList = [...prev, participant];
+        const newParticipant = { ...participant, connectionStatus: 'connecting' };
+        const newList = [...prev, newParticipant];
         setParticipantCount(newList.length + 1); // +1 for self
         return newList;
       });
@@ -363,24 +417,68 @@ function VideoCall() {
       return;
     }
     
+    // Enhanced ICE servers with TURN servers for better connectivity
+    const iceServers = [
+      // Google STUN servers
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' },
+      { urls: 'stun:stun4.l.google.com:19302' },
+      
+      // Additional STUN servers for redundancy
+      { urls: 'stun:stun.stunprotocol.org:3478' },
+      { urls: 'stun:stun.voiparound.com' },
+      { urls: 'stun:stun.voipbuster.com' },
+      
+      // Free TURN servers (you should replace with your own for production)
+      {
+        urls: 'turn:openrelay.metered.ca:80',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      }
+    ];
+    
     const peer = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' }
-      ]
+      iceServers,
+      iceCandidatePoolSize: 10, // Pre-gather ICE candidates
+      iceTransportPolicy: 'all', // Use both STUN and TURN
+      bundlePolicy: 'max-bundle', // Bundle media for better performance
+      rtcpMuxPolicy: 'require' // Multiplex RTP and RTCP
     });
 
-    // Add local stream tracks
+    // Add local stream tracks with optimized settings
     const currentStream = isScreenSharing ? screenStreamRef.current : localStreamRef.current;
     if (currentStream) {
       currentStream.getTracks().forEach(track => {
+        // Configure track settings for better quality
+        if (track.kind === 'audio') {
+          // Apply audio constraints for better quality
+          track.applyConstraints({
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            sampleRate: 48000,
+            channelCount: 1
+          }).catch(err => console.log('Audio constraints not applied:', err));
+        }
+        
         peer.addTrack(track, currentStream);
         console.log(`➕ Added ${track.kind} track to peer connection for ${peerId}`);
       });
     }
 
-    // Handle remote stream
+    // Handle remote stream with connection status tracking
     peer.ontrack = (event) => {
       console.log(`📺 Received remote stream from ${peerId}:`, event.streams[0]);
       const [remoteStream] = event.streams;
@@ -391,48 +489,87 @@ function VideoCall() {
         console.log(`💾 Stored remote stream for ${peerId}. Total streams:`, newStreams.size);
         return newStreams;
       });
+      
+      // Update connection status for this peer
+      setParticipants(prev => prev.map(p => 
+        p.id === peerId ? { ...p, connectionStatus: 'connected' } : p
+      ));
     };
 
-    // Handle ICE candidates
+    // Enhanced ICE candidate handling with immediate sending
     peer.onicecandidate = (event) => {
       if (event.candidate) {
-        console.log(`🧊 Sending ICE candidate to ${peerId}`);
+        console.log(`🧊 Sending ICE candidate to ${peerId}:`, event.candidate.type);
         socketRef.current.emit('ice-candidate', {
           candidate: event.candidate,
           targetId: peerId
         });
+      } else {
+        console.log(`🧊 ICE gathering complete for ${peerId}`);
       }
     };
 
-    // Connection state monitoring
+    // Enhanced connection state monitoring
     peer.onconnectionstatechange = () => {
-      console.log(`🔄 Connection state for ${peerId}: ${peer.connectionState}`);
-      if (peer.connectionState === 'failed' || peer.connectionState === 'disconnected') {
-        console.log(`❌ Peer connection failed for ${peerId}, cleaning up`);
-        // Clean up failed connection
+      const state = peer.connectionState;
+      console.log(`🔄 Connection state for ${peerId}: ${state}`);
+      
+      // Update participant connection status
+      setParticipants(prev => prev.map(p => 
+        p.id === peerId ? { ...p, connectionStatus: state } : p
+      ));
+      
+      if (state === 'connected') {
+        console.log(`✅ Peer connection established with ${peerId}`);
+      } else if (state === 'failed' || state === 'disconnected') {
+        console.log(`❌ Peer connection failed for ${peerId}, attempting reconnection`);
+        // Attempt reconnection after a delay
         setTimeout(() => {
           if (peersRef.current.has(peerId)) {
+            console.log(`🔄 Attempting to reconnect to ${peerId}`);
             peersRef.current.delete(peerId);
             setRemoteStreams(prev => {
               const newStreams = new Map(prev);
               newStreams.delete(peerId);
               return newStreams;
             });
+            // Recreate connection
+            createPeerConnection(peerId, participant, true);
           }
-        }, 5000);
+        }, 3000);
       }
     };
 
     peer.oniceconnectionstatechange = () => {
-      console.log(`🧊 ICE connection state for ${peerId}: ${peer.iceConnectionState}`);
+      const iceState = peer.iceConnectionState;
+      console.log(`🧊 ICE connection state for ${peerId}: ${iceState}`);
+      
+      if (iceState === 'connected' || iceState === 'completed') {
+        console.log(`✅ ICE connection established with ${peerId}`);
+      } else if (iceState === 'failed') {
+        console.log(`❌ ICE connection failed for ${peerId}`);
+      }
+    };
+
+    // Monitor ICE gathering state
+    peer.onicegatheringstatechange = () => {
+      console.log(`🧊 ICE gathering state for ${peerId}: ${peer.iceGatheringState}`);
     };
 
     // Store peer connection
     peersRef.current.set(peerId, peer);
 
+    // Set initial connection status
+    setParticipants(prev => prev.map(p => 
+      p.id === peerId ? { ...p, connectionStatus: 'connecting' } : p
+    ));
+
     // Create offer if we should initiate
     if (shouldCreateOffer) {
-      createOffer(peerId);
+      // Add a small delay to ensure ICE gathering starts
+      setTimeout(() => {
+        createOffer(peerId);
+      }, 100);
     }
   };
 
@@ -890,6 +1027,25 @@ function VideoCall() {
 
   return (
     <div className="video-call-container">
+      {/* Audio Feedback Warning */}
+      {showAudioWarning && (
+        <div className="audio-warning">
+          <div className="warning-content">
+            <div className="warning-icon">🎧</div>
+            <div className="warning-text">
+              <h3>Use Headphones for Better Audio</h3>
+              <p>To prevent echo and feedback, please use headphones or earphones during the call.</p>
+            </div>
+            <button 
+              className="warning-close"
+              onClick={() => setShowAudioWarning(false)}
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <div className="video-call-header">
         <div className="room-info">
@@ -897,10 +1053,21 @@ function VideoCall() {
           {roomInfo && <p>Host: {roomInfo.creatorName}</p>}
           <p>Participants: {participantCount}</p>
         </div>
-        <div className="connection-status">
-          <span className={`status-indicator ${connectionStatus.toLowerCase()}`}>
-            {connectionStatus}
-          </span>
+        <div className="connection-info">
+          <div className="connection-quality">
+            <span className="quality-label">Connection:</span>
+            <div className="quality-bars">
+              <div className="bar bar-1 active"></div>
+              <div className="bar bar-2 active"></div>
+              <div className="bar bar-3 active"></div>
+              <div className="bar bar-4"></div>
+            </div>
+          </div>
+          <div className="connection-status">
+            <span className={`status-indicator ${connectionStatus.toLowerCase()}`}>
+              {connectionStatus}
+            </span>
+          </div>
         </div>
       </div>
 
@@ -1366,6 +1533,7 @@ const RemoteVideo = React.memo(({ participant, stream, index, raisedHands }) => 
 
   const colorClass = `remote-video-${(index % 6) + 1}`;
   const hasRaisedHand = raisedHands.some(h => h.participantId === participant.id);
+  const connectionStatus = participant.connectionStatus || 'connecting';
 
   return (
     <div className={`video-wrapper remote-video ${colorClass}`}>
@@ -1381,20 +1549,36 @@ const RemoteVideo = React.memo(({ participant, stream, index, raisedHands }) => 
         {!participant.isVideoEnabled && ' (Video Off)'}
         {!participant.isAudioEnabled && ' (Muted)'}
         {hasRaisedHand && ' ✋'}
-        {!isStreamActive && ' (Connecting...)'}
       </div>
-      {!isStreamActive && (
+      
+      {/* Connection Status Overlay */}
+      {(!isStreamActive || connectionStatus === 'connecting') && (
         <div className="loading-overlay">
           <div className="loading-spinner"></div>
-          <p>Connecting to {participant.name}...</p>
+          <p>
+            {connectionStatus === 'connecting' && 'Connecting to '}
+            {connectionStatus === 'connected' && !isStreamActive && 'Loading video from '}
+            {connectionStatus === 'failed' && 'Connection failed with '}
+            {connectionStatus === 'disconnected' && 'Reconnecting to '}
+            {participant.name}...
+          </p>
+          <div className="connection-status-indicator">
+            <span className={`status-dot ${connectionStatus}`}></span>
+            <span className="status-text">{connectionStatus}</span>
+          </div>
         </div>
       )}
+      
       <div className="participant-status-overlay">
         {!participant.isVideoEnabled && <span className="status-icon">📹❌</span>}
         {!participant.isAudioEnabled && <span className="status-icon">🎤❌</span>}
+        {connectionStatus === 'connected' && isStreamActive && (
+          <span className="status-icon connected">🟢</span>
+        )}
       </div>
     </div>
   );
+});
 });
 
 export default VideoCall;
