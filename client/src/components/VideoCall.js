@@ -1579,6 +1579,5 @@ const RemoteVideo = React.memo(({ participant, stream, index, raisedHands }) => 
     </div>
   );
 });
-});
 
 export default VideoCall;
