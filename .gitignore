@@ -1,0 +1,82 @@
+# ========================
+# Dependencies
+# ========================
+node_modules/
+client/node_modules/
+server/node_modules/
+.pnp
+.pnp.js
+
+# ========================
+# Build outputs
+# ========================
+client/build/
+build/
+dist/
+
+# ========================
+# Environment / Secrets
+# ========================
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+client/.env
+client/.env.local
+client/.env.production.local
+server/.env
+server/.env.local
+server/.env.production.local
+
+# ========================
+# Logs
+# ========================
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# ========================
+# Runtime data
+# ========================
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# ========================
+# Testing & Coverage
+# ========================
+coverage/
+.nyc_output/
+*.lcov
+
+# ========================
+# Editors & OS
+# ========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ========================
+# Docker
+# ========================
+# Keep Dockerfiles and docker-compose committed
+# but ignore any local override files
+docker-compose.override.yml
+
+# ========================
+# Miscellaneous
+# ========================
+.cache/
+.parcel-cache/
+.eslintcache
+.stylelintcache

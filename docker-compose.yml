@@ -1,0 +1,98 @@
+version: '3.9'
+
+# ==============================================================
+# video-meet — Production Docker Compose
+# ==============================================================
+# Usage:
+#   docker compose --env-file .env up -d --build
+#   docker compose down
+# ==============================================================
+
+services:
+
+  # ---------------------------------------------------------------
+  # Backend: Node.js + Express + Socket.IO signaling server
+  # ---------------------------------------------------------------
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    image: video-meet-server:${APP_VERSION:-latest}
+    container_name: video-meet-server
+    restart: unless-stopped
+
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: ${SERVER_PORT:-5001}
+      # CORS allowed origins (comma-separated list handled in index.js)
+      CLIENT_ORIGIN: ${CLIENT_ORIGIN:-http://localhost:80}
+
+    ports:
+      # Only expose externally if you need direct backend access.
+      # In production behind nginx proxy, you can remove this mapping.
+      - "${SERVER_PORT:-5001}:5001"
+
+    networks:
+      - videomeet-net
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5001/api/rooms"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------
+  # Frontend: React SPA served by nginx
+  # ---------------------------------------------------------------
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+      args:
+        # These are baked into the React production build at image build time.
+        # When nginx proxies /api and /socket.io, the browser hits the same
+        # origin so both can simply point to '' (empty = same-origin).
+        # If you expose the backend on a separate domain, set these in .env.
+        REACT_APP_API_BASE: ${REACT_APP_API_BASE:-/api}
+        REACT_APP_SOCKET_URL: ${REACT_APP_SOCKET_URL:-}
+    image: video-meet-client:${APP_VERSION:-latest}
+    container_name: video-meet-client
+    restart: unless-stopped
+
+    ports:
+      - "${CLIENT_PORT:-80}:80"
+
+    depends_on:
+      server:
+        condition: service_healthy
+
+    networks:
+      - videomeet-net
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ---------------------------------------------------------------
+# Internal bridge network (containers communicate by service name)
+# ---------------------------------------------------------------
+networks:
+  videomeet-net:
+    driver: bridge
+    name: videomeet-net

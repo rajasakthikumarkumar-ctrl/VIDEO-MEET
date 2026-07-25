@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+
+  client:
+    build:
+      context: ./client
+    container_name: video-meet-client
+
+    ports:
+      - "3000:3000"
+
+    depends_on:
+      - server
+
+  server:
+    build:
+      context: ./server
+
+    container_name: video-meet-server
+
+    ports:
+      - "5000:5000"
+
+    restart: always

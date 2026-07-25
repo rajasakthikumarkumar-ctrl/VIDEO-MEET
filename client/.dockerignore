@@ -1,0 +1,39 @@
+# Dependencies - reinstalled inside container
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build output - rebuilt inside container
+build
+
+# Environment files - injected via Docker build args
+.env
+.env.local
+.env.development
+.env.development.local
+.env.test
+.env.test.local
+.env.production
+.env.production.local
+
+# Git
+.git
+.gitignore
+
+# Docker files (no need to copy into the image)
+Dockerfile
+.dockerignore
+
+# Editor and OS artifacts
+.DS_Store
+Thumbs.db
+.vscode
+.idea
+
+# Test and coverage reports
+coverage
+.nyc_output
+
+# CI artifacts
+.cache
