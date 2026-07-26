@@ -1,8 +1,9 @@
 import { render, screen } from '@testing-library/react';
 import App from './App';
 
-test('renders VideoMeet Pro', () => {
+test('renders VideoMeet Pro heading', () => {
   render(<App />);
-  const title = screen.getByText(/videomeet pro/i);
-  expect(title).toBeInTheDocument();
+  expect(
+    screen.getByRole('heading', { name: /videomeet pro/i })
+  ).toBeInTheDocument();
 });
