@@ -2,7 +2,10 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { useParams, useLocation, useNavigate } from 'react-router-dom';
 import io from 'socket.io-client';
 import './VideoCall.css';
- 
+// CHANGE 1: Import SOCKET_URL from config.js instead of hardcoding 'http://localhost:5001'.
+// This makes the socket connection work in both development and production environments
+// without any code change — config.js already selects the right URL based on hostname.
+import { SOCKET_URL } from '../config';
 
 function VideoCall() {
   const { roomId } = useParams();
@@ -24,8 +27,10 @@ function VideoCall() {
   
   // Recording state
   const [isRecording, setIsRecording] = useState(false);
-  const [recordingType, setRecordingType] = useState('both'); // 'video', 'audio', 'both'
-  const [recordedChunks, setRecordedChunks] = useState([]);
+  // CHANGE 3: Removed unused 'recordingType' state — the type is passed as a parameter to
+  // startRecording() and read from the recording object; a top-level state variable was never read.
+  // CHANGE 3 (cont.): Removed unused 'recordedChunks' state — chunks are accumulated inside a
+  // local array inside startRecording() and never read from this state variable.
   const [recordings, setRecordings] = useState([]);
   const [showRecordings, setShowRecordings] = useState(false);
   
@@ -55,7 +60,8 @@ function VideoCall() {
   useEffect(() => {
     // Prevent automatic start - only initialize if we have proper state
     if (!location.state || !location.state.participantName) {
-      console.log('❌ No participant data found, redirecting to home');
+      // CHANGE 6: Removed verbose emoji console.log — kept only actionable error logging.
+      // A simple redirect is self-explanatory; the log added noise without value in production.
       navigate('/');
       return;
     }
@@ -63,12 +69,11 @@ function VideoCall() {
     // Check if this is a valid join attempt (not just page refresh)
     const { participantName, participantEmail, passcode } = location.state;
     if (!participantName || !participantEmail || !passcode) {
-      console.log('❌ Incomplete participant data, redirecting to home');
       navigate('/');
       return;
     }
 
-    console.log('✅ Valid join attempt detected, initializing call');
+    // CHANGE 6 (cont.): Removed 'Valid join attempt detected' log — not needed in production.
     initializeCall();
 
     return () => {
@@ -78,31 +83,58 @@ function VideoCall() {
 
   const initializeCall = async () => {
     try {
-      console.log('🚀 Initializing video call...');
-      
+      // CHANGE 6: Removed '🚀 Initializing video call...' log — startup flow is tracked
+      // by connection-status state which is displayed in the UI.
+
       // Clean up any existing socket connection first
       if (socketRef.current) {
-        console.log('🧹 Cleaning up existing socket connection');
+        // CHANGE 6: Removed 'Cleaning up existing socket' log.
         socketRef.current.disconnect();
         socketRef.current = null;
       }
-      
-      // Initialize socket connection
-      socketRef.current = io('http://localhost:5001', {
+
+      // CHANGE 1 (applied): Connect using SOCKET_URL from config.js instead of the
+      // hardcoded 'http://localhost:5001'. In production the config resolves to the
+      // deployed server URL automatically.
+      socketRef.current = io(SOCKET_URL, {
         forceNew: true, // Force new connection
         transports: ['websocket', 'polling']
       });
-      
-      // Get user media first
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 640, height: 480 },
-        audio: true
-      });
 
-      console.log('📹 Local stream obtained');
+      // Get user media first
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480 },
+          audio: true
+        });
+      } catch (mediaError) {
+        // CHANGE 4: Map specific getUserMedia error names to human-readable messages
+        // instead of showing the generic "Please check permissions" fallback for every case.
+        // NotAllowedError  — user explicitly denied the permission prompt.
+        // NotFoundError    — no camera or microphone device found on the system.
+        // NotReadableError — device exists but is already in use by another application.
+        let userMessage;
+        if (mediaError.name === 'NotAllowedError' || mediaError.name === 'PermissionDeniedError') {
+          userMessage = 'Camera and microphone access was denied. Please allow permissions in your browser settings and try again.';
+        } else if (mediaError.name === 'NotFoundError' || mediaError.name === 'DevicesNotFoundError') {
+          userMessage = 'No camera or microphone found. Please connect a device and try again.';
+        } else if (mediaError.name === 'NotReadableError' || mediaError.name === 'TrackStartError') {
+          userMessage = 'Camera or microphone is already in use by another application. Please close it and try again.';
+        } else if (mediaError.name === 'OverconstrainedError') {
+          userMessage = 'Camera does not support the requested resolution. Please try a different camera.';
+        } else {
+          userMessage = `Unable to access camera/microphone: ${mediaError.message}`;
+        }
+        setError(userMessage);
+        setConnectionStatus('Failed');
+        return; // Stop initialisation — do not proceed without a media stream
+      }
+
+      // CHANGE 6: Removed '📹 Local stream obtained' log.
       setLocalStream(stream);
       localStreamRef.current = stream;
-      
+
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
       }
@@ -111,9 +143,12 @@ function VideoCall() {
 
       // Join room after getting media
       const { participantName, participantEmail, passcode, isHost } = location.state;
-      console.log(`🏠 Joining room ${roomId} as ${participantName} (${isHost ? 'ADMIN' : 'PARTICIPANT'})`);
-      
-      socketRef.current.emit('join-room', {
+      // CHANGE 6: Removed '🏠 Joining room ...' log.
+
+      // CHANGE 2: Use optional chaining on socketRef.current before emitting.
+      // If the socket disconnected between initialisation and this point the emit
+      // is silently skipped instead of throwing "Cannot read properties of null".
+      socketRef.current?.emit('join-room', {
         roomId,
         passcode,
         participantName,
@@ -124,8 +159,8 @@ function VideoCall() {
       setConnectionStatus('Connected');
 
     } catch (error) {
-      console.error('❌ Error initializing call:', error);
-      setError('Unable to access camera/microphone. Please check permissions.');
+      console.error('Error initializing call:', error);
+      setError('Unable to start the call. Please refresh and try again.');
       setConnectionStatus('Failed');
     }
   };
@@ -134,51 +169,41 @@ function VideoCall() {
     const socket = socketRef.current;
 
     socket.on('room-joined', ({ room, isAdmin: adminStatus }) => {
-      console.log('✅ Successfully joined room:', room);
-      console.log('📊 Existing participants received:', room.participants);
-      console.log('👑 Admin status:', adminStatus);
-      
+      // CHANGE 6: Removed verbose room/participant/admin console.log lines.
+      // The UI already reflects this state via roomInfo, isAdmin, and participantCount.
       setRoomInfo(room);
       setIsAdmin(adminStatus);
-      
+
       // CRITICAL: Clear any existing state first
       setParticipants([]);
       setRemoteStreams(new Map());
       peersRef.current.clear();
-      
+
       // Set ONLY the existing participants (excluding self)
       const existingParticipants = room.participants || [];
-      console.log(`📊 Setting ${existingParticipants.length} existing participants`);
       setParticipants(existingParticipants);
       setParticipantCount(existingParticipants.length + 1); // +1 for self
-      
+
       setChatMessages(room.chatMessages || []);
       setRaisedHands(room.raisedHands || []);
-      
+
       // Create peer connections ONLY for existing participants
       existingParticipants.forEach(participant => {
-        console.log(`🤝 Creating peer connection for existing participant: ${participant.name} (${participant.id})`);
         createPeerConnection(participant.id, participant, true);
       });
     });
 
     socket.on('user-joined', (participant) => {
-      console.log('👋 New user joined:', participant);
-      
+      // CHANGE 6: Removed '👋 New user joined' and participant-count logs.
       // Prevent duplicate participants
       setParticipants(prev => {
         const exists = prev.find(p => p.id === participant.id);
-        if (exists) {
-          console.log('⚠️ Participant already exists, skipping:', participant.name);
-          return prev;
-        }
-        
-        console.log('📊 Adding participant to list. Current:', prev.length, 'Adding:', participant.name);
+        if (exists) return prev;
         const newList = [...prev, participant];
         setParticipantCount(newList.length + 1); // +1 for self
         return newList;
       });
-      
+
       // Create peer connection for new participant (they will initiate)
       if (!peersRef.current.has(participant.id)) {
         createPeerConnection(participant.id, participant, false);
@@ -186,111 +211,86 @@ function VideoCall() {
     });
 
     socket.on('participant-count-updated', ({ count }) => {
-      console.log('📊 Participant count updated from server:', count);
+      // CHANGE 6: Removed server count log and mismatch warning — count mismatches
+      // are transient during rapid joins and spam the console without actionable info.
       setParticipantCount(count);
-      
-      // Verify our local state matches server count
-      setParticipants(prev => {
-        const localCount = prev.length + 1; // +1 for self
-        if (localCount !== count) {
-          console.log(`⚠️ Count mismatch! Local: ${localCount}, Server: ${count}`);
-        }
-        return prev;
-      });
     });
 
     socket.on('user-left', (userId) => {
-      console.log('👋 User left:', userId);
-      
-      // Remove from participants
+      // CHANGE 6: Removed stream-removal and peer-close logs.
       setParticipants(prev => {
         const filtered = prev.filter(p => p.id !== userId);
-        console.log('📊 Removing participant. Before:', prev.length, 'After:', filtered.length);
         setParticipantCount(filtered.length + 1); // +1 for self
         return filtered;
       });
-      
+
       // Clean up peer connection
       const peer = peersRef.current.get(userId);
       if (peer) {
         peer.close();
         peersRef.current.delete(userId);
-        console.log(`🔌 Closed peer connection for ${userId}`);
       }
-      
+
       // Remove remote stream
       setRemoteStreams(prev => {
         const newStreams = new Map(prev);
         newStreams.delete(userId);
-        console.log(`🗑️ Removed remote stream for ${userId}`);
         return newStreams;
       });
     });
 
     // Admin-specific event handlers
     socket.on('force-disconnect', ({ reason, message }) => {
-      console.log('🚫 Force disconnected:', reason);
+      // CHANGE 6: Removed force-disconnect console.log.
       alert(message);
       cleanup();
       navigate('/');
     });
 
     socket.on('meeting-ended', ({ reason, message, endedBy }) => {
-      console.log('🔚 Meeting ended:', reason);
+      // CHANGE 6: Removed meeting-ended console.log.
       alert(`${message}${endedBy ? ` by ${endedBy}` : ''}`);
       cleanup();
       navigate('/');
     });
 
     socket.on('participant-removed', ({ participantId, participantName, removedBy }) => {
-      console.log(`🚫 Participant ${participantName} was removed by ${removedBy}`);
-      
+      // CHANGE 6: Removed verbose participant-removal logs and the no-op setTimeout log.
       // Immediately remove from participants list
       setParticipants(prev => {
         const filtered = prev.filter(p => p.id !== participantId);
-        console.log(`📊 Participant removed. Before: ${prev.length}, After: ${filtered.length}`);
         setParticipantCount(filtered.length + 1); // +1 for self
         return filtered;
       });
-      
+
       // Clean up peer connection immediately
       const peer = peersRef.current.get(participantId);
       if (peer) {
         peer.close();
         peersRef.current.delete(participantId);
-        console.log(`🔌 Closed peer connection for removed participant ${participantId}`);
       }
-      
+
       // Remove remote stream immediately
       setRemoteStreams(prev => {
         const newStreams = new Map(prev);
         newStreams.delete(participantId);
-        console.log(`🗑️ Removed remote stream for ${participantId}`);
         return newStreams;
       });
-      
-      // Show notification if not admin
-      if (!isAdmin) {
-        // Show a brief notification about the removal
-        setTimeout(() => {
-          console.log(`ℹ️ ${participantName} was removed from the meeting`);
-        }, 100);
-      }
     });
 
     // WebRTC signaling handlers
     socket.on('offer', async ({ offer, senderId }) => {
-      console.log(`📥 Received offer from ${senderId}`);
+      // CHANGE 6: Removed 'Received offer' log.
       await handleOffer(offer, senderId);
     });
 
     socket.on('answer', async ({ answer, senderId }) => {
-      console.log(`📥 Received answer from ${senderId}`);
+      // CHANGE 6: Removed 'Received answer' log.
       await handleAnswer(answer, senderId);
     });
 
     socket.on('ice-candidate', async ({ candidate, senderId }) => {
-      console.log(`🧊 Received ICE candidate from ${senderId}`);
+      // CHANGE 6: Removed 'Received ICE candidate' log.
       await handleIceCandidate(candidate, senderId);
     });
 
@@ -332,31 +332,30 @@ function VideoCall() {
     });
 
     socket.on('error', (message) => {
-      console.error('❌ Socket error:', message);
+      console.error('Socket error:', message);
       setError(message);
       setConnectionStatus('Error');
     });
 
     socket.on('connect', () => {
-      console.log('🔗 Socket connected');
+      // CHANGE 6: Removed 'Socket connected' log — status is shown in the UI.
       setConnectionStatus('Connected');
     });
 
     socket.on('disconnect', () => {
-      console.log('🔌 Socket disconnected');
+      // CHANGE 6: Removed 'Socket disconnected' log — status is shown in the UI.
       setConnectionStatus('Disconnected');
     });
   };
 
   const createPeerConnection = (peerId, participant, shouldCreateOffer) => {
-    console.log(`🔗 Creating peer connection for ${participant.name} (${peerId}), shouldCreateOffer: ${shouldCreateOffer}`);
-    
+    // CHANGE 6: Removed verbose peer-creation log.
+
     // Check if peer connection already exists
     if (peersRef.current.has(peerId)) {
-      console.log(`⚠️ Peer connection already exists for ${peerId}, skipping`);
       return;
     }
-    
+
     const peer = new RTCPeerConnection({
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -370,19 +369,18 @@ function VideoCall() {
     if (currentStream) {
       currentStream.getTracks().forEach(track => {
         peer.addTrack(track, currentStream);
-        console.log(`➕ Added ${track.kind} track to peer connection for ${peerId}`);
+        // CHANGE 6: Removed per-track 'Added track' log.
       });
     }
 
     // Handle remote stream
     peer.ontrack = (event) => {
-      console.log(`📺 Received remote stream from ${peerId}:`, event.streams[0]);
+      // CHANGE 6: Removed 'Received remote stream' log.
       const [remoteStream] = event.streams;
-      
       setRemoteStreams(prev => {
         const newStreams = new Map(prev);
         newStreams.set(peerId, remoteStream);
-        console.log(`💾 Stored remote stream for ${peerId}. Total streams:`, newStreams.size);
+        // CHANGE 6: Removed 'Stored remote stream' log.
         return newStreams;
       });
     };
@@ -390,8 +388,9 @@ function VideoCall() {
     // Handle ICE candidates
     peer.onicecandidate = (event) => {
       if (event.candidate) {
-        console.log(`🧊 Sending ICE candidate to ${peerId}`);
-        socketRef.current.emit('ice-candidate', {
+        // CHANGE 2: Optional chaining — skip the emit silently if socket is null/disconnected.
+        // This prevents an uncaught TypeError during cleanup or network interruption.
+        socketRef.current?.emit('ice-candidate', {
           candidate: event.candidate,
           targetId: peerId
         });
@@ -400,9 +399,8 @@ function VideoCall() {
 
     // Connection state monitoring
     peer.onconnectionstatechange = () => {
-      console.log(`🔄 Connection state for ${peerId}: ${peer.connectionState}`);
+      // CHANGE 6: Removed connection-state-change log — kept only failure handling.
       if (peer.connectionState === 'failed' || peer.connectionState === 'disconnected') {
-        console.log(`❌ Peer connection failed for ${peerId}, cleaning up`);
         // Clean up failed connection
         setTimeout(() => {
           if (peersRef.current.has(peerId)) {
@@ -417,9 +415,8 @@ function VideoCall() {
       }
     };
 
-    peer.oniceconnectionstatechange = () => {
-      console.log(`🧊 ICE connection state for ${peerId}: ${peer.iceConnectionState}`);
-    };
+    // CHANGE 6: Removed ICE connection state log.
+    peer.oniceconnectionstatechange = () => {};
 
     // Store peer connection
     peersRef.current.set(peerId, peer);
@@ -435,52 +432,51 @@ function VideoCall() {
       const peer = peersRef.current.get(peerId);
       if (!peer) return;
 
-      console.log(`📤 Creating offer for ${peerId}`);
+      // CHANGE 6: Removed 'Creating offer' log.
       const offer = await peer.createOffer();
       await peer.setLocalDescription(offer);
-      
-      socketRef.current.emit('offer', {
+
+      // CHANGE 2: Optional chaining — safe emit even if socket disconnected mid-negotiation.
+      socketRef.current?.emit('offer', {
         offer: offer,
         targetId: peerId
       });
-      
-      console.log(`📤 Offer sent to ${peerId}`);
+      // CHANGE 6: Removed 'Offer sent' log.
     } catch (error) {
-      console.error(`❌ Error creating offer for ${peerId}:`, error);
+      console.error(`Error creating offer for ${peerId}:`, error);
     }
   };
 
   const handleOffer = async (offer, senderId) => {
     try {
       let peer = peersRef.current.get(senderId);
-      
+
       // Create peer connection if it doesn't exist
       if (!peer) {
-        console.log(`🔗 Creating peer connection for incoming offer from ${senderId}`);
+        // CHANGE 6: Removed 'Creating peer connection for incoming offer' log.
         const participant = participants.find(p => p.id === senderId) || { id: senderId, name: 'Unknown' };
         createPeerConnection(senderId, participant, false);
         peer = peersRef.current.get(senderId);
       }
 
       if (!peer) {
-        console.error(`❌ No peer connection found for ${senderId}`);
+        console.error(`No peer connection found for ${senderId}`);
         return;
       }
 
-      console.log(`📥 Processing offer from ${senderId}`);
+      // CHANGE 6: Removed 'Processing offer' log.
       await peer.setRemoteDescription(new RTCSessionDescription(offer));
-      
       const answer = await peer.createAnswer();
       await peer.setLocalDescription(answer);
-      
-      socketRef.current.emit('answer', {
+
+      // CHANGE 2: Optional chaining — safe emit if socket is null at this point.
+      socketRef.current?.emit('answer', {
         answer: answer,
         targetId: senderId
       });
-      
-      console.log(`📤 Answer sent to ${senderId}`);
+      // CHANGE 6: Removed 'Answer sent' log.
     } catch (error) {
-      console.error(`❌ Error handling offer from ${senderId}:`, error);
+      console.error(`Error handling offer from ${senderId}:`, error);
     }
   };
 
@@ -488,15 +484,14 @@ function VideoCall() {
     try {
       const peer = peersRef.current.get(senderId);
       if (!peer) {
-        console.error(`❌ No peer connection found for ${senderId}`);
+        console.error(`No peer connection found for ${senderId}`);
         return;
       }
 
-      console.log(`📥 Processing answer from ${senderId}`);
+      // CHANGE 6: Removed 'Processing answer' and 'Answer processed' logs.
       await peer.setRemoteDescription(new RTCSessionDescription(answer));
-      console.log(`✅ Answer processed from ${senderId}`);
     } catch (error) {
-      console.error(`❌ Error handling answer from ${senderId}:`, error);
+      console.error(`Error handling answer from ${senderId}:`, error);
     }
   };
 
@@ -504,14 +499,14 @@ function VideoCall() {
     try {
       const peer = peersRef.current.get(senderId);
       if (!peer) {
-        console.error(`❌ No peer connection found for ${senderId}`);
+        console.error(`No peer connection found for ${senderId}`);
         return;
       }
 
       await peer.addIceCandidate(new RTCIceCandidate(candidate));
-      console.log(`✅ ICE candidate added for ${senderId}`);
+      // CHANGE 6: Removed 'ICE candidate added' log.
     } catch (error) {
-      console.error(`❌ Error adding ICE candidate from ${senderId}:`, error);
+      console.error(`Error adding ICE candidate from ${senderId}:`, error);
     }
   };
 
@@ -522,8 +517,9 @@ function VideoCall() {
       if (videoTrack) {
         videoTrack.enabled = !videoTrack.enabled;
         setIsVideoEnabled(videoTrack.enabled);
-        socketRef.current.emit('toggle-video', { isEnabled: videoTrack.enabled });
-        console.log(`📹 Video ${videoTrack.enabled ? 'enabled' : 'disabled'}`);
+        // CHANGE 2: Optional chaining — prevents crash if socket is null when toggling.
+        socketRef.current?.emit('toggle-video', { isEnabled: videoTrack.enabled });
+        // CHANGE 6: Removed toggle-video log.
       }
     }
   }, []);
@@ -534,8 +530,9 @@ function VideoCall() {
       if (audioTrack) {
         audioTrack.enabled = !audioTrack.enabled;
         setIsAudioEnabled(audioTrack.enabled);
-        socketRef.current.emit('toggle-audio', { isEnabled: audioTrack.enabled });
-        console.log(`🎤 Audio ${audioTrack.enabled ? 'enabled' : 'disabled'}`);
+        // CHANGE 2: Optional chaining — prevents crash if socket is null when toggling.
+        socketRef.current?.emit('toggle-audio', { isEnabled: audioTrack.enabled });
+        // CHANGE 6: Removed toggle-audio log.
       }
     }
   }, []);
@@ -606,40 +603,46 @@ function VideoCall() {
   const toggleRaiseHand = useCallback(() => {
     const newState = !hasRaisedHand;
     setHasRaisedHand(newState);
-    socketRef.current.emit('toggle-raise-hand', { isRaised: newState });
+    // CHANGE 2: Optional chaining — prevents crash if socket disconnects while user raises hand.
+    socketRef.current?.emit('toggle-raise-hand', { isRaised: newState });
   }, [hasRaisedHand]);
 
   const sendReaction = useCallback((reaction) => {
-    socketRef.current.emit('send-reaction', { reaction });
+    // CHANGE 2: Optional chaining — prevents crash if socket is null when sending reaction.
+    socketRef.current?.emit('send-reaction', { reaction });
   }, []);
 
   const sendChatMessage = useCallback(() => {
     if (newMessage.trim()) {
-      socketRef.current.emit('send-chat-message', { message: newMessage.trim() });
+      // CHANGE 2: Optional chaining — prevents crash if socket disconnects during message send.
+      socketRef.current?.emit('send-chat-message', { message: newMessage.trim() });
       setNewMessage('');
     }
   }, [newMessage]);
 
   const refreshConnection = useCallback(() => {
+    // CHANGE 7: Check that the socket is connected before attempting to refresh peer
+    // connections. If the socket is not available the server cannot relay new offers,
+    // so refreshing would produce silent failures.
+    if (!socketRef.current || !socketRef.current.connected) {
+      setConnectionStatus('Disconnected — cannot refresh');
+      return;
+    }
+
     setConnectionStatus('Refreshing...');
-    console.log('🔄 Refreshing connections...');
-    console.log('📊 Current participants:', participants.length);
-    console.log('📊 Current peer connections:', peersRef.current.size);
-    console.log('📊 Current remote streams:', remoteStreams.size);
-    
+    // CHANGE 6: Removed verbose refresh-start and per-peer logs.
+
     // Close all peer connections
-    peersRef.current.forEach((peer, peerId) => {
-      console.log(`🔌 Closing peer connection for ${peerId}`);
+    peersRef.current.forEach((peer) => {
       peer.close();
     });
     peersRef.current.clear();
     setRemoteStreams(new Map());
-    
+
     // Reconnect after a short delay
     setTimeout(() => {
-      console.log('🔄 Recreating peer connections...');
+      // CHANGE 6: Removed 'Recreating peer connections' log.
       participants.forEach(participant => {
-        console.log(`🤝 Recreating peer connection for ${participant.name}`);
         createPeerConnection(participant.id, participant, true);
       });
       setConnectionStatus('Connected');
@@ -647,27 +650,23 @@ function VideoCall() {
   }, [participants]);
 
   const getStats = useCallback(() => {
-    socketRef.current.emit('get-room-stats');
+    // CHANGE 2: Optional chaining — prevents crash if socket is null when fetching stats.
+    socketRef.current?.emit('get-room-stats');
     setShowStats(true);
   }, []);
 
   // Recording functions
   const startRecording = useCallback(async (type = 'both') => {
     try {
-      console.log(`🎥 Starting ${type} recording...`);
-      
-      let stream;
+      // CHANGE 6: Removed '🎥 Starting recording' log.
       const currentStream = isScreenSharing ? screenStreamRef.current : localStreamRef.current;
-      
+
+      // Determine the stream to record based on type
+      let stream;
       if (type === 'video' || type === 'both') {
-        // Record video (and audio if 'both')
-        const constraints = {
-          video: true,
-          audio: type === 'both'
-        };
         stream = currentStream;
       } else if (type === 'audio') {
-        // Record audio only
+        // Record audio only — build a stream containing just the audio track
         stream = new MediaStream();
         const audioTrack = currentStream.getAudioTracks()[0];
         if (audioTrack) {
@@ -680,14 +679,11 @@ function VideoCall() {
       }
 
       recordingStreamRef.current = stream;
-      setRecordingType(type);
-      
-      // Create MediaRecorder
-      const options = {
-        mimeType: 'video/webm;codecs=vp9,opus'
-      };
-      
-      // Fallback for different browsers
+      // CHANGE 3: Removed setRecordingType() call — the removed state variable was only
+      // written here and never read anywhere else in the component.
+
+      // Create MediaRecorder with a codec fallback chain for cross-browser support
+      const options = { mimeType: 'video/webm;codecs=vp9,opus' };
       if (!MediaRecorder.isTypeSupported(options.mimeType)) {
         options.mimeType = 'video/webm;codecs=vp8,opus';
         if (!MediaRecorder.isTypeSupported(options.mimeType)) {
@@ -708,15 +704,15 @@ function VideoCall() {
       };
 
       mediaRecorderRef.current.onstop = () => {
-        console.log('🎥 Recording stopped, processing...');
-        const blob = new Blob(chunks, { 
-          type: type === 'audio' ? 'audio/webm' : 'video/webm' 
+        // CHANGE 6: Removed 'Recording stopped, processing' log.
+        const blob = new Blob(chunks, {
+          type: type === 'audio' ? 'audio/webm' : 'video/webm'
         });
-        
+
         const url = URL.createObjectURL(blob);
         const timestamp = new Date().toLocaleString();
         const filename = `${type}_recording_${Date.now()}.webm`;
-        
+
         const newRecording = {
           id: Date.now(),
           type,
@@ -724,34 +720,31 @@ function VideoCall() {
           blob,
           filename,
           timestamp,
-          duration: 0 // Will be calculated when played
+          duration: 0 // Calculated when played back
         };
 
         setRecordings(prev => [...prev, newRecording]);
-        console.log(`✅ Recording saved: ${filename}`);
-        
-        // Clear chunks
+        // CHANGE 6: Removed 'Recording saved' log.
         chunks.length = 0;
       };
 
       mediaRecorderRef.current.start(1000); // Collect data every second
       setIsRecording(true);
-      setRecordedChunks([]);
-      
-      console.log(`✅ ${type} recording started`);
-      
+      // CHANGE 3: Removed setRecordedChunks([]) — state variable was removed in Change 3
+      // because chunks are accumulated in a local array inside this closure, not in state.
+      // CHANGE 6: Removed '✅ recording started' log.
+
     } catch (error) {
-      console.error('❌ Error starting recording:', error);
+      console.error('Error starting recording:', error);
       alert('Failed to start recording. Please check your browser permissions.');
     }
   }, [isScreenSharing]);
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && isRecording) {
-      console.log('🛑 Stopping recording...');
+      // CHANGE 6: Removed 'Stopping recording' and 'Recording stopped' logs.
       mediaRecorderRef.current.stop();
       setIsRecording(false);
-      console.log('✅ Recording stopped');
     }
   }, [isRecording]);
 
@@ -762,7 +755,7 @@ function VideoCall() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    console.log(`📥 Downloaded: ${recording.filename}`);
+    // CHANGE 6: Removed 'Downloaded' log.
   }, []);
 
   const deleteRecording = useCallback((recordingId) => {
@@ -770,14 +763,14 @@ function VideoCall() {
       const recording = prev.find(r => r.id === recordingId);
       if (recording) {
         URL.revokeObjectURL(recording.url);
-        console.log(`🗑️ Deleted recording: ${recording.filename}`);
+        // CHANGE 6: Removed 'Deleted recording' log.
       }
       return prev.filter(r => r.id !== recordingId);
     });
   }, []);
 
   const leaveCall = useCallback(() => {
-    console.log('👋 Leaving call...');
+    // CHANGE 6: Removed 'Leaving call' log.
     cleanup();
     navigate('/');
   }, [navigate]);
@@ -785,46 +778,47 @@ function VideoCall() {
   // Admin-only functions
   const removeParticipant = useCallback((participantId) => {
     if (!isAdmin) {
-      console.log('❌ Only admin can remove participants');
+      // CHANGE 6: Removed admin-guard log — the alert shown to the user is sufficient feedback.
       alert('Only the host can remove participants');
       return;
     }
-    
+
     const participant = participants.find(p => p.id === participantId);
     if (!participant) {
-      console.log('❌ Participant not found');
+      // CHANGE 6: Removed 'Participant not found' log — no user-visible action is needed here.
       return;
     }
-    
+
     if (window.confirm(`Remove ${participant.name} from the meeting?\n\nThey will be immediately disconnected and cannot rejoin unless invited again.`)) {
-      console.log('👑 Admin removing participant:', participantId);
-      socketRef.current.emit('admin-remove-participant', { participantId });
-      
-      // Optimistically update UI (will be confirmed by server event)
+      // CHANGE 2: Optional chaining — prevents crash if socket is null when admin removes a participant.
+      // CHANGE 6: Removed 'Admin removing participant' log.
+      socketRef.current?.emit('admin-remove-participant', { participantId });
+
+      // Optimistically update UI (confirmed by server 'participant-removed' event)
       setParticipants(prev => prev.filter(p => p.id !== participantId));
     }
   }, [isAdmin, participants]);
 
   const endMeeting = useCallback(() => {
     if (!isAdmin) {
-      console.log('❌ Only admin can end meeting');
+      // CHANGE 6: Removed admin-guard log.
       alert('Only the host can end the meeting');
       return;
     }
-    
+
     const participantCount = participants.length;
-    const confirmMessage = participantCount > 0 
+    const confirmMessage = participantCount > 0
       ? `End the meeting for all ${participantCount + 1} participants?\n\nEveryone will be disconnected immediately.`
       : 'End the meeting?\n\nThe room will be closed.';
-    
+
     if (window.confirm(confirmMessage)) {
-      console.log('👑 Admin ending meeting');
-      socketRef.current.emit('admin-end-meeting');
-      
-      // Show ending message
+      // CHANGE 2: Optional chaining — prevents crash if socket is null when admin ends meeting.
+      // CHANGE 6: Removed 'Admin ending meeting' log.
+      socketRef.current?.emit('admin-end-meeting');
+
       setConnectionStatus('Ending meeting...');
-      
-      // Clean up and navigate after a brief delay
+
+      // Clean up and navigate after a brief delay to let the server broadcast first
       setTimeout(() => {
         cleanup();
         navigate('/');
@@ -833,38 +827,41 @@ function VideoCall() {
   }, [isAdmin, participants.length, navigate]);
 
   const cleanup = () => {
-    console.log('🧹 Cleaning up...');
-    
+    // CHANGE 6: Removed '🧹 Cleaning up' log.
+
     // Stop recording if active
     if (isRecording && mediaRecorderRef.current) {
       mediaRecorderRef.current.stop();
       setIsRecording(false);
     }
-    
-    // Stop local stream
+
+    // Stop all local media tracks
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(track => {
         track.stop();
-        console.log(`🛑 Stopped ${track.kind} track`);
+        // CHANGE 6: Removed per-track stop log.
       });
     }
-    
-    // Stop screen share stream
+
+    // Stop screen share stream if active
     if (screenStreamRef.current) {
       screenStreamRef.current.getTracks().forEach(track => track.stop());
     }
-    
-    // Close all peer connections
-    peersRef.current.forEach((peer, peerId) => {
+
+    // Close all WebRTC peer connections
+    peersRef.current.forEach((peer) => {
       peer.close();
-      console.log(`🔌 Closed peer connection for ${peerId}`);
+      // CHANGE 6: Removed per-peer close log.
     });
     peersRef.current.clear();
-    
-    // Disconnect socket
+
+    // Disconnect socket and release the reference
     if (socketRef.current) {
       socketRef.current.disconnect();
-      console.log('🔌 Socket disconnected');
+      // CHANGE 5: Null out the ref after disconnect so any pending optional-chained emits
+      // (socketRef.current?.emit) safely short-circuit instead of emitting on a dead socket.
+      socketRef.current = null;
+      // CHANGE 6: Removed 'Socket disconnected' log.
     }
   };
 
@@ -934,12 +931,13 @@ function VideoCall() {
             </div>
           </div>
 
-          {/* Remote videos - ONLY render actual participants with valid data */}
+          {/* Remote videos — only render participants with fully resolved data */}
           {participants
             .filter(participant => participant && participant.id && participant.name)
             .map((participant, index) => {
               const remoteStream = remoteStreams.get(participant.id);
-              console.log(`🎥 Rendering participant: ${participant.name} (${participant.id}), hasStream: ${!!remoteStream}`);
+              // CHANGE 6: Removed per-render participant log — this fired on every re-render
+              // (e.g. every chat message or state update) producing enormous console noise.
               return (
                 <RemoteVideo
                   key={participant.id}
@@ -1352,7 +1350,8 @@ const RemoteVideo = React.memo(({ participant, stream, index, raisedHands }) => 
     if (videoRef.current && stream) {
       videoRef.current.srcObject = stream;
       setIsStreamActive(true);
-      console.log(`📺 Remote video set for ${participant.name}`);
+      // CHANGE 6: Removed 'Remote video set for ...' log — fires on every stream assignment,
+      // producing log spam during normal connection churn.
     } else {
       setIsStreamActive(false);
     }
