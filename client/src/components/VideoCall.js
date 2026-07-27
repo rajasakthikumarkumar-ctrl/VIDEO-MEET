@@ -15,7 +15,8 @@ function VideoCall() {
   // State management
   const [participants, setParticipants] = useState([]);
   const [remoteStreams, setRemoteStreams] = useState(new Map());
-  const [localStream, setLocalStream] = useState(null);
+  // localStream state removed — the value was written once but never read in JSX or
+  // any other callback.  localStreamRef is the live reference used throughout.
   const [isVideoEnabled, setIsVideoEnabled] = useState(true);
   const [isAudioEnabled, setIsAudioEnabled] = useState(true);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
@@ -57,63 +58,263 @@ function VideoCall() {
   const mediaRecorderRef = useRef();
   const recordingStreamRef = useRef();
 
-  useEffect(() => {
-    // Prevent automatic start - only initialize if we have proper state
-    if (!location.state || !location.state.participantName) {
-      // CHANGE 6: Removed verbose emoji console.log — kept only actionable error logging.
-      // A simple redirect is self-explanatory; the log added noise without value in production.
-      navigate('/');
-      return;
+  // ─────────────────────────────────────────────────────────────────────────
+  // Hooks are declared bottom-up so every function is defined before it is
+  // referenced.  This satisfies no-use-before-define without disabling ESLint.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // 1. cleanup ── leaf: only reads isRecording state + refs. No other hooks.
+  const cleanup = useCallback(() => {
+    if (isRecording && mediaRecorderRef.current) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
     }
-
-    // Check if this is a valid join attempt (not just page refresh)
-    const { participantName, participantEmail, passcode } = location.state;
-    if (!participantName || !participantEmail || !passcode) {
-      navigate('/');
-      return;
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => track.stop());
     }
+    if (screenStreamRef.current) {
+      screenStreamRef.current.getTracks().forEach(track => track.stop());
+    }
+    peersRef.current.forEach(peer => peer.close());
+    peersRef.current.clear();
+    if (socketRef.current) {
+      socketRef.current.disconnect();
+      socketRef.current = null;
+    }
+  }, [isRecording]);
 
-    // CHANGE 6 (cont.): Removed 'Valid join attempt detected' log — not needed in production.
-    initializeCall();
-
-    return () => {
-      cleanup();
-    };
+  // 2. createOffer ── leaf: only reads refs.
+  const createOffer = useCallback(async (peerId) => {
+    try {
+      const peer = peersRef.current.get(peerId);
+      if (!peer) return;
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+      socketRef.current?.emit('offer', { offer, targetId: peerId });
+    } catch (err) {
+      console.error(`Error creating offer for ${peerId}:`, err);
+    }
   }, []);
 
-  const initializeCall = async () => {
+  // 3. handleOffer ── leaf: only reads refs.
+  const handleOffer = useCallback(async (offer, senderId) => {
     try {
-      // CHANGE 6: Removed '🚀 Initializing video call...' log — startup flow is tracked
-      // by connection-status state which is displayed in the UI.
+      const peer = peersRef.current.get(senderId);
+      if (!peer) { console.error(`No peer connection found for ${senderId}`); return; }
+      await peer.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await peer.createAnswer();
+      await peer.setLocalDescription(answer);
+      socketRef.current?.emit('answer', { answer, targetId: senderId });
+    } catch (err) {
+      console.error(`Error handling offer from ${senderId}:`, err);
+    }
+  }, []);
 
-      // Clean up any existing socket connection first
+  // 4. handleAnswer ── leaf: only reads refs.
+  const handleAnswer = useCallback(async (answer, senderId) => {
+    try {
+      const peer = peersRef.current.get(senderId);
+      if (!peer) { console.error(`No peer connection found for ${senderId}`); return; }
+      await peer.setRemoteDescription(new RTCSessionDescription(answer));
+    } catch (err) {
+      console.error(`Error handling answer from ${senderId}:`, err);
+    }
+  }, []);
+
+  // 5. handleIceCandidate ── leaf: only reads refs.
+  const handleIceCandidate = useCallback(async (candidate, senderId) => {
+    try {
+      const peer = peersRef.current.get(senderId);
+      if (!peer) { console.error(`No peer connection found for ${senderId}`); return; }
+      await peer.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (err) {
+      console.error(`Error adding ICE candidate from ${senderId}:`, err);
+    }
+  }, []);
+
+  // 6. createPeerConnection ── depends on isScreenSharing state + createOffer.
+  const createPeerConnection = useCallback((peerId, _participant, shouldCreateOffer) => {
+    if (peersRef.current.has(peerId)) return;
+
+    const peer = new RTCPeerConnection({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+      ],
+    });
+
+    const currentStream = isScreenSharing ? screenStreamRef.current : localStreamRef.current;
+    if (currentStream) {
+      currentStream.getTracks().forEach(track => peer.addTrack(track, currentStream));
+    }
+
+    peer.ontrack = (event) => {
+      const [remoteStream] = event.streams;
+      setRemoteStreams(prev => {
+        const m = new Map(prev);
+        m.set(peerId, remoteStream);
+        return m;
+      });
+    };
+
+    peer.onicecandidate = (event) => {
+      if (event.candidate) {
+        socketRef.current?.emit('ice-candidate', {
+          candidate: event.candidate,
+          targetId: peerId,
+        });
+      }
+    };
+
+    peer.onconnectionstatechange = () => {
+      if (peer.connectionState === 'failed' || peer.connectionState === 'disconnected') {
+        setTimeout(() => {
+          if (peersRef.current.has(peerId)) {
+            peersRef.current.delete(peerId);
+            setRemoteStreams(prev => {
+              const m = new Map(prev);
+              m.delete(peerId);
+              return m;
+            });
+          }
+        }, 5000);
+      }
+    };
+
+    peer.oniceconnectionstatechange = () => {};
+
+    peersRef.current.set(peerId, peer);
+    if (shouldCreateOffer) createOffer(peerId);
+  }, [isScreenSharing, createOffer]);
+
+  // 7. setupSocketListeners ── depends on createPeerConnection, handleOffer,
+  //    handleAnswer, handleIceCandidate, cleanup, navigate.
+  const setupSocketListeners = useCallback(() => {
+    const socket = socketRef.current;
+
+    socket.on('room-joined', ({ room, isAdmin: adminStatus }) => {
+      setRoomInfo(room);
+      setIsAdmin(adminStatus);
+      setParticipants([]);
+      setRemoteStreams(new Map());
+      peersRef.current.clear();
+      const existing = room.participants || [];
+      setParticipants(existing);
+      setParticipantCount(existing.length + 1);
+      setChatMessages(room.chatMessages || []);
+      setRaisedHands(room.raisedHands || []);
+      existing.forEach(p => createPeerConnection(p.id, p, true));
+    });
+
+    socket.on('user-joined', (participant) => {
+      setParticipants(prev => {
+        if (prev.find(p => p.id === participant.id)) return prev;
+        const next = [...prev, participant];
+        setParticipantCount(next.length + 1);
+        return next;
+      });
+      if (!peersRef.current.has(participant.id)) {
+        createPeerConnection(participant.id, participant, false);
+      }
+    });
+
+    socket.on('participant-count-updated', ({ count }) => setParticipantCount(count));
+
+    socket.on('user-left', (userId) => {
+      setParticipants(prev => {
+        const filtered = prev.filter(p => p.id !== userId);
+        setParticipantCount(filtered.length + 1);
+        return filtered;
+      });
+      const p = peersRef.current.get(userId);
+      if (p) { p.close(); peersRef.current.delete(userId); }
+      setRemoteStreams(prev => { const m = new Map(prev); m.delete(userId); return m; });
+    });
+
+    socket.on('force-disconnect', ({ message }) => {
+      alert(message);
+      cleanup();
+      navigate('/');
+    });
+
+    socket.on('meeting-ended', ({ message, endedBy }) => {
+      alert(`${message}${endedBy ? ` by ${endedBy}` : ''}`);
+      cleanup();
+      navigate('/');
+    });
+
+    socket.on('participant-removed', ({ participantId }) => {
+      setParticipants(prev => {
+        const filtered = prev.filter(p => p.id !== participantId);
+        setParticipantCount(filtered.length + 1);
+        return filtered;
+      });
+      const p = peersRef.current.get(participantId);
+      if (p) { p.close(); peersRef.current.delete(participantId); }
+      setRemoteStreams(prev => { const m = new Map(prev); m.delete(participantId); return m; });
+    });
+
+    socket.on('offer', async ({ offer, senderId }) => { await handleOffer(offer, senderId); });
+    socket.on('answer', async ({ answer, senderId }) => { await handleAnswer(answer, senderId); });
+    socket.on('ice-candidate', async ({ candidate, senderId }) => { await handleIceCandidate(candidate, senderId); });
+
+    socket.on('new-chat-message', msg => setChatMessages(prev => [...prev, msg]));
+
+    socket.on('new-reaction', (reaction) => {
+      setReactions(prev => [...prev, reaction]);
+      setTimeout(() => setReactions(prev => prev.filter(r => r.id !== reaction.id)), 3000);
+    });
+
+    socket.on('participant-hand-toggle', ({ participantId, isRaised, participantName }) => {
+      if (isRaised) {
+        setRaisedHands(prev => [...prev, { participantId, participantName }]);
+      } else {
+        setRaisedHands(prev => prev.filter(h => h.participantId !== participantId));
+      }
+    });
+
+    socket.on('participant-video-toggle', ({ participantId, isEnabled }) => {
+      setParticipants(prev => prev.map(p =>
+        p.id === participantId ? { ...p, isVideoEnabled: isEnabled } : p
+      ));
+    });
+
+    socket.on('participant-audio-toggle', ({ participantId, isEnabled }) => {
+      setParticipants(prev => prev.map(p =>
+        p.id === participantId ? { ...p, isAudioEnabled: isEnabled } : p
+      ));
+    });
+
+    socket.on('room-stats', stats => setRoomStats(stats));
+
+    socket.on('error', (message) => {
+      console.error('Socket error:', message);
+      setError(message);
+      setConnectionStatus('Error');
+    });
+
+    socket.on('connect', () => setConnectionStatus('Connected'));
+    socket.on('disconnect', () => setConnectionStatus('Disconnected'));
+  }, [createPeerConnection, handleOffer, handleAnswer, handleIceCandidate, cleanup, navigate]);
+
+  // 8. initializeCall ── depends on setupSocketListeners, roomId, location.state.
+  const initializeCall = useCallback(async () => {
+    try {
       if (socketRef.current) {
-        // CHANGE 6: Removed 'Cleaning up existing socket' log.
         socketRef.current.disconnect();
         socketRef.current = null;
       }
 
-      // CHANGE 1 (applied): Connect using SOCKET_URL from config.js instead of the
-      // hardcoded 'http://localhost:5001'. In production the config resolves to the
-      // deployed server URL automatically.
-      socketRef.current = io(SOCKET_URL, {
-        forceNew: true, // Force new connection
-        transports: ['websocket', 'polling']
-      });
+      socketRef.current = io(SOCKET_URL, { forceNew: true, transports: ['websocket', 'polling'] });
 
-      // Get user media first
       let stream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           video: { width: 640, height: 480 },
-          audio: true
+          audio: true,
         });
       } catch (mediaError) {
-        // CHANGE 4: Map specific getUserMedia error names to human-readable messages
-        // instead of showing the generic "Please check permissions" fallback for every case.
-        // NotAllowedError  — user explicitly denied the permission prompt.
-        // NotFoundError    — no camera or microphone device found on the system.
-        // NotReadableError — device exists but is already in use by another application.
         let userMessage;
         if (mediaError.name === 'NotAllowedError' || mediaError.name === 'PermissionDeniedError') {
           userMessage = 'Camera and microphone access was denied. Please allow permissions in your browser settings and try again.';
@@ -128,398 +329,86 @@ function VideoCall() {
         }
         setError(userMessage);
         setConnectionStatus('Failed');
-        return; // Stop initialisation — do not proceed without a media stream
+        return;
       }
 
-      // CHANGE 6: Removed '📹 Local stream obtained' log.
-      setLocalStream(stream);
       localStreamRef.current = stream;
-
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
-      }
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
 
       setupSocketListeners();
 
-      // Join room after getting media
       const { participantName, participantEmail, passcode, isHost } = location.state;
-      // CHANGE 6: Removed '🏠 Joining room ...' log.
-
-      // CHANGE 2: Use optional chaining on socketRef.current before emitting.
-      // If the socket disconnected between initialisation and this point the emit
-      // is silently skipped instead of throwing "Cannot read properties of null".
       socketRef.current?.emit('join-room', {
         roomId,
         passcode,
         participantName,
         participantEmail,
-        isHost: isHost || false
+        isHost: isHost || false,
       });
-
       setConnectionStatus('Connected');
-
-    } catch (error) {
-      console.error('Error initializing call:', error);
+    } catch (err) {
+      console.error('Error initializing call:', err);
       setError('Unable to start the call. Please refresh and try again.');
       setConnectionStatus('Failed');
     }
-  };
+  }, [roomId, location.state, setupSocketListeners]);
 
-  const setupSocketListeners = () => {
-    const socket = socketRef.current;
-
-    socket.on('room-joined', ({ room, isAdmin: adminStatus }) => {
-      // CHANGE 6: Removed verbose room/participant/admin console.log lines.
-      // The UI already reflects this state via roomInfo, isAdmin, and participantCount.
-      setRoomInfo(room);
-      setIsAdmin(adminStatus);
-
-      // CRITICAL: Clear any existing state first
-      setParticipants([]);
-      setRemoteStreams(new Map());
-      peersRef.current.clear();
-
-      // Set ONLY the existing participants (excluding self)
-      const existingParticipants = room.participants || [];
-      setParticipants(existingParticipants);
-      setParticipantCount(existingParticipants.length + 1); // +1 for self
-
-      setChatMessages(room.chatMessages || []);
-      setRaisedHands(room.raisedHands || []);
-
-      // Create peer connections ONLY for existing participants
-      existingParticipants.forEach(participant => {
-        createPeerConnection(participant.id, participant, true);
-      });
-    });
-
-    socket.on('user-joined', (participant) => {
-      // CHANGE 6: Removed '👋 New user joined' and participant-count logs.
-      // Prevent duplicate participants
-      setParticipants(prev => {
-        const exists = prev.find(p => p.id === participant.id);
-        if (exists) return prev;
-        const newList = [...prev, participant];
-        setParticipantCount(newList.length + 1); // +1 for self
-        return newList;
-      });
-
-      // Create peer connection for new participant (they will initiate)
-      if (!peersRef.current.has(participant.id)) {
-        createPeerConnection(participant.id, participant, false);
+  // 9. stopScreenShare ── defined before toggleScreenShare which calls it.
+  const stopScreenShare = useCallback(async () => {
+    if (screenStreamRef.current) {
+      screenStreamRef.current.getTracks().forEach(track => track.stop());
+    }
+    setIsScreenSharing(false);
+    for (const peer of peersRef.current.values()) {
+      const sender = peer.getSenders().find(s => s.track && s.track.kind === 'video');
+      if (sender && localStreamRef.current) {
+        await sender.replaceTrack(localStreamRef.current.getVideoTracks()[0]);
       }
-    });
+    }
+    if (localVideoRef.current && localStreamRef.current) {
+      localVideoRef.current.srcObject = localStreamRef.current;
+    }
+  }, []);
 
-    socket.on('participant-count-updated', ({ count }) => {
-      // CHANGE 6: Removed server count log and mismatch warning — count mismatches
-      // are transient during rapid joins and spam the console without actionable info.
-      setParticipantCount(count);
-    });
-
-    socket.on('user-left', (userId) => {
-      // CHANGE 6: Removed stream-removal and peer-close logs.
-      setParticipants(prev => {
-        const filtered = prev.filter(p => p.id !== userId);
-        setParticipantCount(filtered.length + 1); // +1 for self
-        return filtered;
-      });
-
-      // Clean up peer connection
-      const peer = peersRef.current.get(userId);
-      if (peer) {
-        peer.close();
-        peersRef.current.delete(userId);
-      }
-
-      // Remove remote stream
-      setRemoteStreams(prev => {
-        const newStreams = new Map(prev);
-        newStreams.delete(userId);
-        return newStreams;
-      });
-    });
-
-    // Admin-specific event handlers
-    socket.on('force-disconnect', ({ reason, message }) => {
-      // CHANGE 6: Removed force-disconnect console.log.
-      alert(message);
-      cleanup();
-      navigate('/');
-    });
-
-    socket.on('meeting-ended', ({ reason, message, endedBy }) => {
-      // CHANGE 6: Removed meeting-ended console.log.
-      alert(`${message}${endedBy ? ` by ${endedBy}` : ''}`);
-      cleanup();
-      navigate('/');
-    });
-
-    socket.on('participant-removed', ({ participantId, participantName, removedBy }) => {
-      // CHANGE 6: Removed verbose participant-removal logs and the no-op setTimeout log.
-      // Immediately remove from participants list
-      setParticipants(prev => {
-        const filtered = prev.filter(p => p.id !== participantId);
-        setParticipantCount(filtered.length + 1); // +1 for self
-        return filtered;
-      });
-
-      // Clean up peer connection immediately
-      const peer = peersRef.current.get(participantId);
-      if (peer) {
-        peer.close();
-        peersRef.current.delete(participantId);
-      }
-
-      // Remove remote stream immediately
-      setRemoteStreams(prev => {
-        const newStreams = new Map(prev);
-        newStreams.delete(participantId);
-        return newStreams;
-      });
-    });
-
-    // WebRTC signaling handlers
-    socket.on('offer', async ({ offer, senderId }) => {
-      // CHANGE 6: Removed 'Received offer' log.
-      await handleOffer(offer, senderId);
-    });
-
-    socket.on('answer', async ({ answer, senderId }) => {
-      // CHANGE 6: Removed 'Received answer' log.
-      await handleAnswer(answer, senderId);
-    });
-
-    socket.on('ice-candidate', async ({ candidate, senderId }) => {
-      // CHANGE 6: Removed 'Received ICE candidate' log.
-      await handleIceCandidate(candidate, senderId);
-    });
-
-    // Chat and interaction handlers
-    socket.on('new-chat-message', (message) => {
-      setChatMessages(prev => [...prev, message]);
-    });
-
-    socket.on('new-reaction', (reaction) => {
-      setReactions(prev => [...prev, reaction]);
-      // Remove reaction after 3 seconds
-      setTimeout(() => {
-        setReactions(prev => prev.filter(r => r.id !== reaction.id));
-      }, 3000);
-    });
-
-    socket.on('participant-hand-toggle', ({ participantId, isRaised, participantName }) => {
-      if (isRaised) {
-        setRaisedHands(prev => [...prev, { participantId, participantName }]);
+  // 10. toggleScreenShare ── depends on isScreenSharing + stopScreenShare.
+  const toggleScreenShare = useCallback(async () => {
+    try {
+      if (!isScreenSharing) {
+        const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        screenStreamRef.current = screenStream;
+        setIsScreenSharing(true);
+        for (const peer of peersRef.current.values()) {
+          const sender = peer.getSenders().find(s => s.track && s.track.kind === 'video');
+          if (sender) await sender.replaceTrack(screenStream.getVideoTracks()[0]);
+        }
+        if (localVideoRef.current) localVideoRef.current.srcObject = screenStream;
+        screenStream.getVideoTracks()[0].onended = () => stopScreenShare();
       } else {
-        setRaisedHands(prev => prev.filter(h => h.participantId !== participantId));
+        stopScreenShare();
       }
-    });
-
-    socket.on('participant-video-toggle', ({ participantId, isEnabled }) => {
-      setParticipants(prev => prev.map(p => 
-        p.id === participantId ? { ...p, isVideoEnabled: isEnabled } : p
-      ));
-    });
-
-    socket.on('participant-audio-toggle', ({ participantId, isEnabled }) => {
-      setParticipants(prev => prev.map(p => 
-        p.id === participantId ? { ...p, isAudioEnabled: isEnabled } : p
-      ));
-    });
-
-    socket.on('room-stats', (stats) => {
-      setRoomStats(stats);
-    });
-
-    socket.on('error', (message) => {
-      console.error('Socket error:', message);
-      setError(message);
-      setConnectionStatus('Error');
-    });
-
-    socket.on('connect', () => {
-      // CHANGE 6: Removed 'Socket connected' log — status is shown in the UI.
-      setConnectionStatus('Connected');
-    });
-
-    socket.on('disconnect', () => {
-      // CHANGE 6: Removed 'Socket disconnected' log — status is shown in the UI.
-      setConnectionStatus('Disconnected');
-    });
-  };
-
-  const createPeerConnection = (peerId, participant, shouldCreateOffer) => {
-    // CHANGE 6: Removed verbose peer-creation log.
-
-    // Check if peer connection already exists
-    if (peersRef.current.has(peerId)) {
-      return;
+    } catch (err) {
+      console.error('Error toggling screen share:', err);
     }
+  }, [isScreenSharing, stopScreenShare]);
 
-    const peer = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' }
-      ]
-    });
+  // 11. Main useEffect ── all deps defined above.
+  useEffect(() => {
+    if (!location.state || !location.state.participantName) { navigate('/'); return; }
+    const { participantName, participantEmail, passcode } = location.state;
+    if (!participantName || !participantEmail || !passcode) { navigate('/'); return; }
+    initializeCall();
+    return () => { cleanup(); };
+  }, [initializeCall, cleanup, location.state, navigate]);
 
-    // Add local stream tracks
-    const currentStream = isScreenSharing ? screenStreamRef.current : localStreamRef.current;
-    if (currentStream) {
-      currentStream.getTracks().forEach(track => {
-        peer.addTrack(track, currentStream);
-        // CHANGE 6: Removed per-track 'Added track' log.
-      });
-    }
+  // ── Remaining callbacks (no ordering constraint among themselves) ─────────
 
-    // Handle remote stream
-    peer.ontrack = (event) => {
-      // CHANGE 6: Removed 'Received remote stream' log.
-      const [remoteStream] = event.streams;
-      setRemoteStreams(prev => {
-        const newStreams = new Map(prev);
-        newStreams.set(peerId, remoteStream);
-        // CHANGE 6: Removed 'Stored remote stream' log.
-        return newStreams;
-      });
-    };
-
-    // Handle ICE candidates
-    peer.onicecandidate = (event) => {
-      if (event.candidate) {
-        // CHANGE 2: Optional chaining — skip the emit silently if socket is null/disconnected.
-        // This prevents an uncaught TypeError during cleanup or network interruption.
-        socketRef.current?.emit('ice-candidate', {
-          candidate: event.candidate,
-          targetId: peerId
-        });
-      }
-    };
-
-    // Connection state monitoring
-    peer.onconnectionstatechange = () => {
-      // CHANGE 6: Removed connection-state-change log — kept only failure handling.
-      if (peer.connectionState === 'failed' || peer.connectionState === 'disconnected') {
-        // Clean up failed connection
-        setTimeout(() => {
-          if (peersRef.current.has(peerId)) {
-            peersRef.current.delete(peerId);
-            setRemoteStreams(prev => {
-              const newStreams = new Map(prev);
-              newStreams.delete(peerId);
-              return newStreams;
-            });
-          }
-        }, 5000);
-      }
-    };
-
-    // CHANGE 6: Removed ICE connection state log.
-    peer.oniceconnectionstatechange = () => {};
-
-    // Store peer connection
-    peersRef.current.set(peerId, peer);
-
-    // Create offer if we should initiate
-    if (shouldCreateOffer) {
-      createOffer(peerId);
-    }
-  };
-
-  const createOffer = async (peerId) => {
-    try {
-      const peer = peersRef.current.get(peerId);
-      if (!peer) return;
-
-      // CHANGE 6: Removed 'Creating offer' log.
-      const offer = await peer.createOffer();
-      await peer.setLocalDescription(offer);
-
-      // CHANGE 2: Optional chaining — safe emit even if socket disconnected mid-negotiation.
-      socketRef.current?.emit('offer', {
-        offer: offer,
-        targetId: peerId
-      });
-      // CHANGE 6: Removed 'Offer sent' log.
-    } catch (error) {
-      console.error(`Error creating offer for ${peerId}:`, error);
-    }
-  };
-
-  const handleOffer = async (offer, senderId) => {
-    try {
-      let peer = peersRef.current.get(senderId);
-
-      // Create peer connection if it doesn't exist
-      if (!peer) {
-        // CHANGE 6: Removed 'Creating peer connection for incoming offer' log.
-        const participant = participants.find(p => p.id === senderId) || { id: senderId, name: 'Unknown' };
-        createPeerConnection(senderId, participant, false);
-        peer = peersRef.current.get(senderId);
-      }
-
-      if (!peer) {
-        console.error(`No peer connection found for ${senderId}`);
-        return;
-      }
-
-      // CHANGE 6: Removed 'Processing offer' log.
-      await peer.setRemoteDescription(new RTCSessionDescription(offer));
-      const answer = await peer.createAnswer();
-      await peer.setLocalDescription(answer);
-
-      // CHANGE 2: Optional chaining — safe emit if socket is null at this point.
-      socketRef.current?.emit('answer', {
-        answer: answer,
-        targetId: senderId
-      });
-      // CHANGE 6: Removed 'Answer sent' log.
-    } catch (error) {
-      console.error(`Error handling offer from ${senderId}:`, error);
-    }
-  };
-
-  const handleAnswer = async (answer, senderId) => {
-    try {
-      const peer = peersRef.current.get(senderId);
-      if (!peer) {
-        console.error(`No peer connection found for ${senderId}`);
-        return;
-      }
-
-      // CHANGE 6: Removed 'Processing answer' and 'Answer processed' logs.
-      await peer.setRemoteDescription(new RTCSessionDescription(answer));
-    } catch (error) {
-      console.error(`Error handling answer from ${senderId}:`, error);
-    }
-  };
-
-  const handleIceCandidate = async (candidate, senderId) => {
-    try {
-      const peer = peersRef.current.get(senderId);
-      if (!peer) {
-        console.error(`No peer connection found for ${senderId}`);
-        return;
-      }
-
-      await peer.addIceCandidate(new RTCIceCandidate(candidate));
-      // CHANGE 6: Removed 'ICE candidate added' log.
-    } catch (error) {
-      console.error(`Error adding ICE candidate from ${senderId}:`, error);
-    }
-  };
-
-  // Media control functions
   const toggleVideo = useCallback(() => {
     if (localStreamRef.current) {
       const videoTrack = localStreamRef.current.getVideoTracks()[0];
       if (videoTrack) {
         videoTrack.enabled = !videoTrack.enabled;
         setIsVideoEnabled(videoTrack.enabled);
-        // CHANGE 2: Optional chaining — prevents crash if socket is null when toggling.
         socketRef.current?.emit('toggle-video', { isEnabled: videoTrack.enabled });
-        // CHANGE 6: Removed toggle-video log.
       }
     }
   }, []);
@@ -530,219 +419,95 @@ function VideoCall() {
       if (audioTrack) {
         audioTrack.enabled = !audioTrack.enabled;
         setIsAudioEnabled(audioTrack.enabled);
-        // CHANGE 2: Optional chaining — prevents crash if socket is null when toggling.
         socketRef.current?.emit('toggle-audio', { isEnabled: audioTrack.enabled });
-        // CHANGE 6: Removed toggle-audio log.
       }
-    }
-  }, []);
-
-  const toggleScreenShare = useCallback(async () => {
-    try {
-      if (!isScreenSharing) {
-        // Start screen sharing
-        const screenStream = await navigator.mediaDevices.getDisplayMedia({
-          video: true,
-          audio: true
-        });
-        
-        screenStreamRef.current = screenStream;
-        setIsScreenSharing(true);
-        
-        // Replace video track in all peer connections
-        peersRef.current.forEach(async (peer, peerId) => {
-          const sender = peer.getSenders().find(s => 
-            s.track && s.track.kind === 'video'
-          );
-          if (sender) {
-            await sender.replaceTrack(screenStream.getVideoTracks()[0]);
-          }
-        });
-        
-        // Update local video
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = screenStream;
-        }
-        
-        // Handle screen share end
-        screenStream.getVideoTracks()[0].onended = () => {
-          stopScreenShare();
-        };
-        
-      } else {
-        stopScreenShare();
-      }
-    } catch (error) {
-      console.error('❌ Error toggling screen share:', error);
-    }
-  }, [isScreenSharing]);
-
-  const stopScreenShare = useCallback(async () => {
-    if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach(track => track.stop());
-    }
-    
-    setIsScreenSharing(false);
-    
-    // Replace back to camera stream
-    peersRef.current.forEach(async (peer, peerId) => {
-      const sender = peer.getSenders().find(s => 
-        s.track && s.track.kind === 'video'
-      );
-      if (sender && localStreamRef.current) {
-        await sender.replaceTrack(localStreamRef.current.getVideoTracks()[0]);
-      }
-    });
-    
-    // Update local video back to camera
-    if (localVideoRef.current && localStreamRef.current) {
-      localVideoRef.current.srcObject = localStreamRef.current;
     }
   }, []);
 
   const toggleRaiseHand = useCallback(() => {
     const newState = !hasRaisedHand;
     setHasRaisedHand(newState);
-    // CHANGE 2: Optional chaining — prevents crash if socket disconnects while user raises hand.
     socketRef.current?.emit('toggle-raise-hand', { isRaised: newState });
   }, [hasRaisedHand]);
 
   const sendReaction = useCallback((reaction) => {
-    // CHANGE 2: Optional chaining — prevents crash if socket is null when sending reaction.
     socketRef.current?.emit('send-reaction', { reaction });
   }, []);
 
   const sendChatMessage = useCallback(() => {
     if (newMessage.trim()) {
-      // CHANGE 2: Optional chaining — prevents crash if socket disconnects during message send.
       socketRef.current?.emit('send-chat-message', { message: newMessage.trim() });
       setNewMessage('');
     }
   }, [newMessage]);
 
   const refreshConnection = useCallback(() => {
-    // CHANGE 7: Check that the socket is connected before attempting to refresh peer
-    // connections. If the socket is not available the server cannot relay new offers,
-    // so refreshing would produce silent failures.
     if (!socketRef.current || !socketRef.current.connected) {
       setConnectionStatus('Disconnected — cannot refresh');
       return;
     }
-
     setConnectionStatus('Refreshing...');
-    // CHANGE 6: Removed verbose refresh-start and per-peer logs.
-
-    // Close all peer connections
-    peersRef.current.forEach((peer) => {
-      peer.close();
-    });
+    peersRef.current.forEach(peer => peer.close());
     peersRef.current.clear();
     setRemoteStreams(new Map());
-
-    // Reconnect after a short delay
     setTimeout(() => {
-      // CHANGE 6: Removed 'Recreating peer connections' log.
-      participants.forEach(participant => {
-        createPeerConnection(participant.id, participant, true);
-      });
+      participants.forEach(p => createPeerConnection(p.id, p, true));
       setConnectionStatus('Connected');
     }, 1000);
-  }, [participants]);
+  }, [participants, createPeerConnection]);
 
   const getStats = useCallback(() => {
-    // CHANGE 2: Optional chaining — prevents crash if socket is null when fetching stats.
     socketRef.current?.emit('get-room-stats');
     setShowStats(true);
   }, []);
 
-  // Recording functions
   const startRecording = useCallback(async (type = 'both') => {
     try {
-      // CHANGE 6: Removed '🎥 Starting recording' log.
       const currentStream = isScreenSharing ? screenStreamRef.current : localStreamRef.current;
-
-      // Determine the stream to record based on type
       let stream;
       if (type === 'video' || type === 'both') {
         stream = currentStream;
       } else if (type === 'audio') {
-        // Record audio only — build a stream containing just the audio track
         stream = new MediaStream();
         const audioTrack = currentStream.getAudioTracks()[0];
-        if (audioTrack) {
-          stream.addTrack(audioTrack);
-        }
+        if (audioTrack) stream.addTrack(audioTrack);
       }
-
-      if (!stream) {
-        throw new Error('No stream available for recording');
-      }
-
+      if (!stream) throw new Error('No stream available for recording');
       recordingStreamRef.current = stream;
-      // CHANGE 3: Removed setRecordingType() call — the removed state variable was only
-      // written here and never read anywhere else in the component.
-
-      // Create MediaRecorder with a codec fallback chain for cross-browser support
       const options = { mimeType: 'video/webm;codecs=vp9,opus' };
       if (!MediaRecorder.isTypeSupported(options.mimeType)) {
         options.mimeType = 'video/webm;codecs=vp8,opus';
         if (!MediaRecorder.isTypeSupported(options.mimeType)) {
           options.mimeType = 'video/webm';
-          if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-            options.mimeType = '';
-          }
+          if (!MediaRecorder.isTypeSupported(options.mimeType)) options.mimeType = '';
         }
       }
-
       mediaRecorderRef.current = new MediaRecorder(stream, options);
       const chunks = [];
-
       mediaRecorderRef.current.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          chunks.push(event.data);
-        }
+        if (event.data.size > 0) chunks.push(event.data);
       };
-
       mediaRecorderRef.current.onstop = () => {
-        // CHANGE 6: Removed 'Recording stopped, processing' log.
-        const blob = new Blob(chunks, {
-          type: type === 'audio' ? 'audio/webm' : 'video/webm'
-        });
-
+        const blob = new Blob(chunks, { type: type === 'audio' ? 'audio/webm' : 'video/webm' });
         const url = URL.createObjectURL(blob);
         const timestamp = new Date().toLocaleString();
         const filename = `${type}_recording_${Date.now()}.webm`;
-
-        const newRecording = {
-          id: Date.now(),
-          type,
-          url,
-          blob,
-          filename,
-          timestamp,
-          duration: 0 // Calculated when played back
-        };
-
-        setRecordings(prev => [...prev, newRecording]);
-        // CHANGE 6: Removed 'Recording saved' log.
+        setRecordings(prev => [
+          ...prev,
+          { id: Date.now(), type, url, blob, filename, timestamp, duration: 0 },
+        ]);
         chunks.length = 0;
       };
-
-      mediaRecorderRef.current.start(1000); // Collect data every second
+      mediaRecorderRef.current.start(1000);
       setIsRecording(true);
-      // CHANGE 3: Removed setRecordedChunks([]) — state variable was removed in Change 3
-      // because chunks are accumulated in a local array inside this closure, not in state.
-      // CHANGE 6: Removed '✅ recording started' log.
-
-    } catch (error) {
-      console.error('Error starting recording:', error);
+    } catch (err) {
+      console.error('Error starting recording:', err);
       alert('Failed to start recording. Please check your browser permissions.');
     }
   }, [isScreenSharing]);
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && isRecording) {
-      // CHANGE 6: Removed 'Stopping recording' and 'Recording stopped' logs.
       mediaRecorderRef.current.stop();
       setIsRecording(false);
     }
@@ -755,115 +520,43 @@ function VideoCall() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    // CHANGE 6: Removed 'Downloaded' log.
   }, []);
 
   const deleteRecording = useCallback((recordingId) => {
     setRecordings(prev => {
       const recording = prev.find(r => r.id === recordingId);
-      if (recording) {
-        URL.revokeObjectURL(recording.url);
-        // CHANGE 6: Removed 'Deleted recording' log.
-      }
+      if (recording) URL.revokeObjectURL(recording.url);
       return prev.filter(r => r.id !== recordingId);
     });
   }, []);
 
   const leaveCall = useCallback(() => {
-    // CHANGE 6: Removed 'Leaving call' log.
     cleanup();
     navigate('/');
-  }, [navigate]);
+  }, [cleanup, navigate]);
 
-  // Admin-only functions
   const removeParticipant = useCallback((participantId) => {
-    if (!isAdmin) {
-      // CHANGE 6: Removed admin-guard log — the alert shown to the user is sufficient feedback.
-      alert('Only the host can remove participants');
-      return;
-    }
-
+    if (!isAdmin) { alert('Only the host can remove participants'); return; }
     const participant = participants.find(p => p.id === participantId);
-    if (!participant) {
-      // CHANGE 6: Removed 'Participant not found' log — no user-visible action is needed here.
-      return;
-    }
-
+    if (!participant) return;
     if (window.confirm(`Remove ${participant.name} from the meeting?\n\nThey will be immediately disconnected and cannot rejoin unless invited again.`)) {
-      // CHANGE 2: Optional chaining — prevents crash if socket is null when admin removes a participant.
-      // CHANGE 6: Removed 'Admin removing participant' log.
       socketRef.current?.emit('admin-remove-participant', { participantId });
-
-      // Optimistically update UI (confirmed by server 'participant-removed' event)
       setParticipants(prev => prev.filter(p => p.id !== participantId));
     }
   }, [isAdmin, participants]);
 
   const endMeeting = useCallback(() => {
-    if (!isAdmin) {
-      // CHANGE 6: Removed admin-guard log.
-      alert('Only the host can end the meeting');
-      return;
-    }
-
-    const participantCount = participants.length;
-    const confirmMessage = participantCount > 0
-      ? `End the meeting for all ${participantCount + 1} participants?\n\nEveryone will be disconnected immediately.`
+    if (!isAdmin) { alert('Only the host can end the meeting'); return; }
+    const count = participants.length;
+    const confirmMessage = count > 0
+      ? `End the meeting for all ${count + 1} participants?\n\nEveryone will be disconnected immediately.`
       : 'End the meeting?\n\nThe room will be closed.';
-
     if (window.confirm(confirmMessage)) {
-      // CHANGE 2: Optional chaining — prevents crash if socket is null when admin ends meeting.
-      // CHANGE 6: Removed 'Admin ending meeting' log.
       socketRef.current?.emit('admin-end-meeting');
-
       setConnectionStatus('Ending meeting...');
-
-      // Clean up and navigate after a brief delay to let the server broadcast first
-      setTimeout(() => {
-        cleanup();
-        navigate('/');
-      }, 2000);
+      setTimeout(() => { cleanup(); navigate('/'); }, 2000);
     }
-  }, [isAdmin, participants.length, navigate]);
-
-  const cleanup = () => {
-    // CHANGE 6: Removed '🧹 Cleaning up' log.
-
-    // Stop recording if active
-    if (isRecording && mediaRecorderRef.current) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-    }
-
-    // Stop all local media tracks
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach(track => {
-        track.stop();
-        // CHANGE 6: Removed per-track stop log.
-      });
-    }
-
-    // Stop screen share stream if active
-    if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach(track => track.stop());
-    }
-
-    // Close all WebRTC peer connections
-    peersRef.current.forEach((peer) => {
-      peer.close();
-      // CHANGE 6: Removed per-peer close log.
-    });
-    peersRef.current.clear();
-
-    // Disconnect socket and release the reference
-    if (socketRef.current) {
-      socketRef.current.disconnect();
-      // CHANGE 5: Null out the ref after disconnect so any pending optional-chained emits
-      // (socketRef.current?.emit) safely short-circuit instead of emitting on a dead socket.
-      socketRef.current = null;
-      // CHANGE 6: Removed 'Socket disconnected' log.
-    }
-  };
+  }, [isAdmin, participants.length, cleanup, navigate]);
 
   if (error) {
     return (
