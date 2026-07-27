@@ -24,7 +24,7 @@
 //   Stage 1  — Checkout source from Git
 //   Stage 2  — Install server dependencies (npm ci)
 //   Stage 3  — Install client dependencies (npm ci)
-//   Stage 4  — Run server tests  (skipped gracefully — no tests yet)
+//   Stage 4  — Run server tests  (auto-detected: skipped if no real suite exists)
 //   Stage 5  — Run client tests  (react-scripts test, CI=true)
 //   Stage 6  — Build React production bundle (npm run build)
 //   Stage 7  — Build Docker images (server + client) via docker-compose
@@ -175,21 +175,62 @@ pipeline {
 
         // -------------------------------------------------------
         // Stage 4: Server Tests
-        // Skipped gracefully because server/package.json currently
-        // has no real test suite (script exits 1 by design).
-        // Remove the 'catchError' wrapper once tests are added.
+        //
+        // Auto-detects whether a real test suite exists before
+        // running anything.  Two independent checks are performed:
+        //
+        //   CHECK A — package.json test script
+        //     Reads server/package.json and extracts the value of
+        //     the "test" key.  If it matches the default npm
+        //     placeholder ("echo \"Error: no test specified\"...")
+        //     there is no real suite and the stage is skipped.
+        //
+        //   CHECK B — test directory
+        //     Looks for a server/test or server/__tests__ folder.
+        //     Absence of both also means no real suite.
+        //
+        // If either check fails to find real tests the stage prints
+        // a clear skip message and exits 0 — the build is never
+        // marked UNSTABLE or FAILED because tests are absent.
+        //
+        // When a real test suite is added in the future (both checks
+        // will pass automatically) `npm test` runs without any
+        // changes to this Jenkinsfile.
         // -------------------------------------------------------
         stage('Server Tests') {
             steps {
-                echo "🧪 Running server tests..."
-                dir('server') {
-                    // catchError: marks the step as UNSTABLE instead of FAILED
-                    // so the pipeline continues until real tests are introduced.
-                    catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
-                        sh 'npm test'
+                script {
+                    dir('server') {
+                        // ── CHECK A: inspect the test script value ────────
+                        // node -p prints the value to stdout; we capture it.
+                        def testScript = sh(
+                            script: '''node -p "require('./package.json').scripts.test || ''"''',
+                            returnStdout: true
+                        ).trim()
+
+                        // ── CHECK B: look for a test directory ────────────
+                        def testDirExists = sh(
+                            script: 'test -d test || test -d __tests__ && echo "yes" || echo "no"',
+                            returnStdout: true
+                        ).trim() == 'yes'
+
+                        // ── Decide: skip or run ───────────────────────────
+                        // The default npm placeholder always contains the
+                        // literal phrase "no test specified".  Any other
+                        // non-empty script value is treated as a real suite.
+                        boolean isPlaceholder = testScript.contains('no test specified') ||
+                                                testScript.isEmpty()
+
+                        if (isPlaceholder && !testDirExists) {
+                            echo "⏭️  Skipping server tests because no backend tests are available."
+                            echo "   (Add a real test script to server/package.json and a test/"
+                            echo "    directory to enable this stage automatically.)"
+                        } else {
+                            echo "🧪 Running server tests..."
+                            sh 'npm test'
+                        }
                     }
                 }
-                echo "ℹ️  Server has no test suite yet — stage skipped gracefully."
             }
         }
 
@@ -477,7 +518,7 @@ EOF
         }
 
         unstable {
-            echo "⚠️  Build #${BUILD_NUMBER} is UNSTABLE (server has no tests yet)."
+            echo "⚠️  Build #${BUILD_NUMBER} is UNSTABLE — check stage logs for details."
         }
 
         cleanup {
