@@ -1,6 +1,6 @@
 # video-meet
 
-A production-ready, real-time video conferencing application built with React, Node.js, Express, Socket.IO, and WebRTC. Supports multi-participant video calls, passcode-protected rooms, in-meeting chat, reactions, hand raising, screen sharing, and admin controls — all running in Docker.
+A production-ready, real-time video conferencing application built with React, Node.js, Express, Socket.IO, and WebRTC. Supports multi-participant video calls, passcode-protected rooms, in-meeting chat, reactions, hand raising, screen sharing, and admin controls — all running in docker.
 
 ---
 
